@@ -125,6 +125,18 @@ Chat Completions、Responses API，以及独立网页管理（模型、统计、
 > 请只按本文档下方的方式安装：使用本仓库的 Release 发布包，或本地源码目录。
 > 其它渠道出现的同名包一律以本仓库为准。
 
+**本地 fork：MyAI 开发实例**
+
+本 fork 的运行依赖通过 `package.json` 中的相对 `link:` 复用同级 `deepseek-harness-dev` 检出，避免账号渠道在源码安装时找不到内核包，也避免加载另一份 Cordis。恢复时先构建开发检出，再在本仓库执行：
+
+```bash
+pnpm install --prod --ignore-scripts --config.auto-install-peers=false --lockfile=false --registry=https://registry.npmmirror.com
+DSH_HOME="$HOME/.dsh-dev" node ../../../deepseek-harness-dev/apps/cli/lib/bin.js plugin --profile web add "link:$PWD"
+node vendor/channel-pack/pack.js
+```
+
+在开发 profile 的用户 patch 中覆盖 `our-free-model` 的 `config.distribution: managed`，防止应用内更新改写 Git 源码。转发与局域网中继保持默认关闭，现有默认模型不变。此安装不修改或重启生产实例；免费上游的额度限制不属于安装故障。
+
 **命令行（纯 dsh web）**
 
 ```

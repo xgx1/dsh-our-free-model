@@ -64,6 +64,13 @@
     }
   },
   "license": "MIT",
+  "dependencies": {
+    "@deepseek-ai/cordis": "link:../../../deepseek-harness-dev/vendor/cordis",
+    "@deepseek-ai/dsh-commands": "link:../../../deepseek-harness-dev/packages/interaction/commands",
+    "@deepseek-ai/dsh-credentials": "link:../../../deepseek-harness-dev/packages/credentials/credentials",
+    "@deepseek-ai/dsh-llm": "link:../../../deepseek-harness-dev/packages/llm/llm",
+    "@deepseek-ai/schemastery": "link:../../../deepseek-harness-dev/vendor/schemastery"
+  },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
     "@deepseek-ai/dsh-commands": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1",
