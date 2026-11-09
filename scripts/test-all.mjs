@@ -31,11 +31,17 @@ if (!['all', 'contributor', 'release'].includes(options.mode)) {
   process.exit(1)
 }
 const { mode, only } = options
-const releaseSuites = new Set(['manifest', 'release', 'catalog'])
+const releaseSuites = new Set(['manifest', 'legacy-payload', 'release', 'catalog', 'legacy-upgrade', 'engine-payload'])
 
 const suites = [
   ['manifest', 'build-manifest.mjs', ['--check']],
+  // The shipped bundles (token-saver, o2a, core) and the engine parts must
+  // match their sources; a stale src/o2a.js would make every suite below test
+  // yesterday's shaping while src/o2a/ already looks updated.
+  ['legacy-payload', 'build-legacy-payload.mjs', ['--check']],
   ['release', 'release-e2e.mjs', []],
+  ['legacy-upgrade', 'legacy-upgrade-test.mjs', mode === 'contributor' ? [] : ['--production']],
+  ['engine-payload', 'engine-payload-test.mjs', []],
   ['release-preparation', 'release-preparation-test.mjs', []],
   ['client-lint', 'client-lint.mjs', []],
   ['sponsor', 'sponsor-test.mjs', []],
@@ -45,12 +51,32 @@ const suites = [
   ['feed', 'feed-test.mjs', []],
   ['picks', 'picks-test.mjs', []],
   ['picks-ui', 'picks-ui-test.mjs', []],
+  ['stat-bucket-ui', 'stat-bucket-ui-test.mjs', []],
+  ['free-pool', 'free-pool-test.mjs', []],
   ['updater', 'updater-test.mjs', []],
   ['upgrade-ui', 'upgrade-ui-test.mjs', []],
   ['reload', 'reload-test.mjs', []],
   ['forward', 'forward-test.mjs', []],
+  ['gemini-gateway', 'gemini-gateway-test.mjs', []],
+  ['private-file', 'private-file-permissions-test.mjs', []],
+  ['subscriptions', 'subscriptions-test.mjs', []],
+  ['subscription-completion', 'subscription-completion-test.mjs', []],
+  ['subscription-wiring', 'subscription-wiring-test.mjs', []],
+  ['magpie-engine', 'magpie-engine-test.mjs', []],
+  ['engine-transport', 'engine-transport-test.mjs', []],
+  ['magpie-models', 'magpie-models-test.mjs', []],
+  ['magpie-policy', 'magpie-policy-test.mjs', []],
+  ['magpie-plugin', 'magpie-plugin-test.mjs', []],
+  ['workbench', 'workbench-test.mjs', []],
+  ['workbench-library', 'workbench-library-test.mjs', []],
+  ['workbench-management', 'workbench-management-test.mjs', []],
+  ['client-terminal', 'client-terminal-test.mjs', []],
+  ['quota-routing', 'quota-routing-test.mjs', []],
+  ['turn-accounting', 'turn-accounting-test.mjs', []],
   ['chan-relay', 'chan-relay-test.mjs', []],
   ['channel-pack', 'channel-pack-test.mjs', []],
+  ['channel-pack-gate', 'channel-pack-gate-test.mjs', []],
+  ['auto-checkin-tick', 'auto-checkin-tick-test.mjs', []],
   ['channel-source', 'channel-pack-test.mjs', ['--source', '--channels-only']],
   ['channel-network', 'channel-network-test.mjs', []],
   ['channel-credits-rpc', 'channel-credits-rpc-test.mjs', []],
@@ -62,6 +88,7 @@ const suites = [
   ['forward-boot', 'forward-boot-test.mjs', []],
   ['standalone', 'standalone-test.mjs', []],
   ['desktop', 'desktop-test.mjs', []],
+  ['desktop-update', 'desktop-update-test.mjs', []],
   ['standalone-desktop-regression', 'standalone-desktop-regression-test.mjs', []],
   ['standalone-page-lifecycle', 'standalone-page-lifecycle-test.mjs', []],
   ['standalone-management', 'standalone-management-test.mjs', []],
@@ -74,13 +101,22 @@ const suites = [
   ['standalone-settings-host', 'standalone-settings-host-test.mjs', []],
   ['standalone-login-terminal', 'standalone-login-terminal-test.mjs', []],
   ['standalone-package', 'standalone-package-test.mjs', ['--sources-only']],
+  ['bun-fetch', 'bun-fetch-test.mjs', []],
+  ['free-lane-compat', 'free-lane-compat-test.mjs', []],
+  ['stable-session', 'stable-session-test.mjs', []],
   ['egress', 'egress-test.mjs', []],
+  ['egress-availability', 'egress-availability-test.mjs', []],
   ['effort', 'effort-test.mjs', []],
   ['projection', 'projection-test.mjs', []],
   ['fingerprint', 'fingerprint-test.mjs', []],
+  ['wire-tool-alias', 'wire-tool-alias-test.mjs', []],
   ['opencode-parity', 'opencode-parity-test.mjs', []],
   ['free-lane-wire', 'free-lane-wire-test.mjs', []],
   ['freetier-gate', 'freetier-gate-test.mjs', []],
+  ['free-lane-quota', 'free-lane-quota-test.mjs', []],
+  ['extensions', 'extensions-test.mjs', []],
+  ['plugins', 'plugins-test.mjs', []],
+  ['plugins-ui', 'plugins-ui-test.mjs', []],
   ['sniff', 'sniff-test.mjs', []],
   ['stream-failure', 'stream-failure-test.mjs', []],
   ['truncation', 'truncation-test.mjs', []],
@@ -119,6 +155,8 @@ const suites = [
   ['bench-integration', 'bench-integration-test.mjs', []],
   ['plugin-bench-ui', 'plugin-bench-ui-test.mjs', []],
   ['gateway-source', 'gateway-source-test.mjs', []],
+  ['gateway-disconnect', 'gateway-disconnect-test.mjs', []],
+  ['standalone-nav', 'standalone-nav-test.mjs', []],
 ].filter(([name]) => (mode === 'contributor' ? !['manifest', 'release'].includes(name)
   : mode === 'release' ? releaseSuites.has(name) : true)
   && (only === null || name.startsWith(only)))
@@ -137,7 +175,7 @@ if (only !== null && suites.length === 0) {
  * detail" because buffered child output was unavailable. The deadline is well
  * above the slowest suite, and live output now identifies the last check seen.
  */
-const SUITE_TIMEOUT_MS = 60_000
+const SUITE_TIMEOUT_MS = 120_000
 
 /**
  * Run a suite while forwarding its output as it arrives. Keeping the output
@@ -148,6 +186,9 @@ function runSuite(script, args) {
   return new Promise(resolve => {
     const child = spawn(process.execPath, [path.join(scriptsDir, script), ...args], {
       stdio: ['ignore', 'pipe', 'pipe'],
+      // Offline suites mock Node fetch. The Bun protocol has its own loopback
+      // tests; never let an existing mock accidentally send a live request.
+      env: { ...process.env, OUR_FREE_MODEL_FREE_TRANSPORT: 'node' },
     })
     let stdout = ''
     let stderr = ''

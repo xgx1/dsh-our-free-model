@@ -29,6 +29,7 @@ import fs from 'node:fs'
 import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { externalUrl, openExternal } from './src/open-external.js'
+import { findBunExecutable } from './src/bun-fetch.js'
 import { ROUTE_LABELS, ROUTE_MAIN, ROUTE_REGION } from './src/adapter.js'
 import { DATA_DIR_NAME, resolveDshHome, publicModelVisibility, validateModelVisibility, isModelHidden } from './src/store.js'
 import { isEacEntry, isKiloEntry } from './src/catalog.js'
@@ -36,7 +37,7 @@ import { STATE } from './src/probe.js'
 import { generateKey, rankLanAddresses, startForwardServer, startLanRelay } from './src/forward.js'
 import { chanGatewayCredential, chanGatewayEnabled, chanGatewayPort, startChanRelay } from './src/chan-relay.js'
 import { CODE, UpstreamError } from './src/http.js'
-import { egressActive, egressFetch, outletLabel, readOutletSelection, startEgressRelay } from './src/egress.js'
+import { egressActive, egressFetch, outletLabel, readOutletSelection, startEgressRelay, setFreeLaneProxy, freeLaneProxyActive, laneProxyEcho } from './src/egress.js'
 import { directFetch } from './src/eac.js'
 import { clearEacUser, readEacUser, writeEacUser } from './src/eac-user.js'
 import { createEacLoginPoller } from './src/eac-login.js'
@@ -45,21 +46,29 @@ import { DEFAULT_LEVEL, budgetLadder, hasDeclaredEffortMenu } from './src/effort
 import { modelAvailability } from './src/model-test.js'
 import { AnnouncementFeed } from './src/feed.js'
 import { createPickStats } from './src/picks.js'
-import { PluginUpdater } from './src/updater.js'
-import { selfReload, watchPackage, isReloading } from './src/reload.js'
+import { PluginUpdater, installationIsManaged } from './src/updater.js'
+import { selfReload, watchPackage, isReloading, canSafelyHotReload } from './src/reload.js'
 import { createPushHub } from './src/push.js'
 import { rejectionFor, isLoopbackHost, connectionAdmissionView } from './src/trust.js'
 import { resolveAttributionUserAgent } from './adapter/kernel.js'
 import { buildAggregateCatalog, fetchProviderModels, isAggregateEntry, testProvider } from './src/aggregate.js'
-import { buildComboCatalog, isComboEntry, normalizeCombos, pruneRotation } from './src/combos.js'
+import { buildComboCatalog, COMBO_STRATEGIES, isComboEntry, normalizeCombos, pruneRotation } from './src/combos.js'
 import { getProvider, listProviders } from './src/providers/index.js'
-import { addSavings, describeSavingsTotal, emptySavings, saverConfig, savingsPercent } from './src/token-saver/index.js'
-import { CAVEMAN_LEVELS, PONYTAIL_LEVELS } from './src/token-saver/prompts.js'
+import { addSavings, describeSavingsTotal, emptySavings, saverConfig, savingsPercent } from './src/token-saver.js'
+import { CAVEMAN_LEVELS, PONYTAIL_LEVELS } from './src/token-saver.js'
 import { OPTIMIZATIONS } from './src/local-optimize.js'
-import { createModelRuntime, createRuntimeStores } from './src/core/runtime.js'
+import { createModelRuntime, createRuntimeStores } from './src/core.js'
+import { createSubscriptions } from './src/subscriptions.js'
+import { createSubscriptionRuntime } from './src/subscription-completion.js'
+import { isSubscriptionEntry } from './src/subscription-adapter.js'
+import { createMagpieEngine, findAgentCli } from './src/magpie-engine.js'
+import { createExtensionRuntime } from './src/extensions.js'
+import { builtinDescriptors } from './src/plugins.js'
+import { createMagpieModels, combineSubscriptionRuntimes } from './src/magpie-models.js'
+import { DISCLAIMER, DISCLAIMER_VERSION, disclaimerAcknowledged } from './src/disclaimer.js'
 
-export { fromOpenAiMessages } from './src/core/completion.js'
-import { buildStats } from './src/core/stats.js'
+export { fromOpenAiMessages } from './src/core.js'
+import { buildStats } from './src/core.js'
 export { buildStats }
 
 export const name = 'our-free-model'
@@ -139,6 +148,15 @@ export function apply(ctx, config) {
   fs.mkdirSync(dataDir, { recursive: true })
   const packageVersion = version
 
+  // Environment readiness: the official free lane's POST inference needs a
+  // local Bun, and a user who never learns that reads only a failed turn.
+  // Probe once at boot — the summary's `bun` bit and this log line are the two
+  // surfaces the answer lives on.
+  const bunAvailable = findBunExecutable() !== undefined
+  if (!bunAvailable) {
+    logger.warn?.('our-free-model: 未检测到本机 Bun —— OpenCode 免费车道无法推理。请安装 Bun（https://bun.sh 或 npm i -g bun）后重启，或把可执行文件路径写入 OUR_FREE_MODEL_BUN。(Bun not found: the OpenCode free lane cannot run inference)')
+  }
+
   // A hot reload re-enters apply with fresh stores; the generation counter lives
   // on globalThis so the new instance knows it replaced a predecessor, and does
   // the post-swap bookkeeping itself (the old closure must not touch stores
@@ -157,6 +175,7 @@ export function apply(ctx, config) {
   /** `managed` stands down everything that would rewrite the installed bytes. */
   const distribution = distributionOf(config, settings)
   const managed = distribution === 'managed'
+    || installationIsManaged(PKG_DIR)
 
   let forward = null
   let forwardError = ''
@@ -406,16 +425,55 @@ export function apply(ctx, config) {
     }
   }
 
+  const magpieEngine = createMagpieEngine({ dataDir, logger })
+  // The extension runtime is created a few lines below; the lazy reference
+  // gives the magpie lane the enhancement-hook seam without reordering boot.
+  let extensionHookRuntime = null
+  const magpieModels = createMagpieModels({
+    engine: magpieEngine, stats, logger,
+    onChanged: () => modelRuntime.syncAggregateCatalog(),
+    extensionRuntime: () => extensionHookRuntime,
+  })
+  let subscriptions
+  let subscriptionRuntime
+  try {
+    subscriptions = createSubscriptions({ dataDir })
+    subscriptionRuntime = createSubscriptionRuntime({ subscriptions, stats, logger })
+  } catch {
+    // A broken private sidecar must not disable the anonymous model lane.
+    subscriptions = undefined
+    logger.warn?.('our-free-model: private subscription storage is unavailable')
+  }
+  subscriptionRuntime = combineSubscriptionRuntimes(magpieModels, subscriptionRuntime)
+  // The OFM extension platform: the marketplace's client side. Created before
+  // the model runtime so the extension lane exists for the first merge; the
+  // async mount (worker starts, registry warm-up) lands through the callback.
+  const extensions = createExtensionRuntime({
+    dataDir,
+    logger,
+    hostVersion: packageVersion,
+    onCatalogChanged: () => {
+      if (disposed) return
+      try { modelRuntime.syncExtensionCatalog() } catch { /* the runtime may not exist yet during boot */ }
+    },
+  })
+  // Built-ins register through the same kernel as installed plugins. The DSH
+  // client renders channel/enhancement contributions; page contributions are
+  // a desktop-console surface.
+  for (const descriptor of builtinDescriptors()) extensions.registerBuiltin(descriptor)
+  extensionHookRuntime = extensions
   const modelRuntime = createModelRuntime({
     ...stores,
     logger,
+    subscriptionRuntime,
+    extensionRuntime: extensions,
     attributionUserAgent: 'deepseek-harness',
     resolveImage: imageResolver(ctx, logger),
     sealedCredential: sealedCredentialOf,
     onSealedUnavailable: () => logger.warn?.('our-free-model: the sealed lane is not available in this composition (no recognized host profile); its models stay hidden'),
     onTopology: () => emitTopology(),
   })
-  const { state, adapter, refreshCatalog, refreshAvailability, watchEgress, fetchListing, publicModelRows, syncAggregateCatalog } = modelRuntime
+  const { state, adapter, refreshCatalog, refreshAvailability, watchEgress, fetchListing, publicModelRows, syncAggregateCatalog, clearLaneBreaker } = modelRuntime
   const runForwarded = modelRuntime.complete
 
   // ── registration ────────────────────────────────────────────────────────────
@@ -428,9 +486,10 @@ export function apply(ctx, config) {
   // Advertise a probe endpoint for the in-app "detect models" button. It offers
   // what the picker itself advertises — a model the gateway refuses to route at
   // all must not be addable to a profile just because it still appears in the
-  // upstream listing.
+  // upstream listing. Automatic availability probing is disabled by owner
+  // policy, so discovery refreshes the listing only.
   ctx.llm.registerModelDiscovery?.(ctx.fiber?.entry?.options?.id ?? name, async () => {
-    await refreshCatalog({ probe: true, force: true })
+    await refreshCatalog({ probe: false, force: true })
     const advertised = new Set(Object.values(state().membership).flat())
     return modelRuntime.catalog
       .filter(entry => advertised.has(entry.id))
@@ -449,9 +508,8 @@ export function apply(ctx, config) {
 
   /**
    * A freshly started outlet needs a moment before its nodes carry traffic: the
-   * first read comes back empty, and a re-probe fired on that cold path would
-   * record "unavailable" for models the new exit would have unlocked. Retry a
-   * few times and let the re-probe run only once the exit answers.
+   * first read comes back empty. Retry a few times so the settings page gets a
+   * reading; no availability probe is fired here (automatic probing is off).
    */
   async function settleOutletWatch() {
     let lastError
@@ -833,6 +891,23 @@ export function apply(ctx, config) {
     outletSyncInFlight = run
     try { await run } finally { if (outletSyncInFlight === run) outletSyncInFlight = null }
   }
+  /**
+   * Apply the settings file's lane proxy to the egress layer.
+   *
+   * Boot-time sync; the settings route re-applies on every `freeLane` patch
+   * through `sanitizeSettings` (which is where a bad address fails the write).
+   * A stored value that no longer parses is dropped with one log line — the
+   * lane falls back to the global outlet rather than failing every turn.
+   */
+  function syncFreeLaneProxy() {
+    try {
+      setFreeLaneProxy(String(settings.get().freeLane?.proxyUrl ?? ''))
+    } catch (error) {
+      logger.warn?.(`our-free-model: the OpenCode lane proxy address is invalid (${error?.message ?? error}); the lane keeps its current exit`)
+      setFreeLaneProxy('')
+    }
+  }
+  syncFreeLaneProxy()
   async function syncEgressOnce() {
     const desired = settings.get().egress ?? {}
     const wanted = desired.enabled === true
@@ -921,6 +996,9 @@ export function apply(ctx, config) {
     const status = updater.status()
     if (status.applying) throw new Error('an upgrade is already running')
     if (status.recoveryRequired) throw new Error('restore the retained upgrade backup before reloading')
+    if (status.restartRequired || !canSafelyHotReload(ctx.loader, PKG_URL.href)) {
+      return { ok: false, error: 'safe hot reload is unavailable in this host; restart the host to load installed files', restored: true, restartRequired: true }
+    }
     const result = await selfReload(ctx, { logger, packageUrl: PKG_URL.href, entryUrl: ENTRY_URL })
     if (result.ok) return result
     throw new Error(result.error)
@@ -929,12 +1007,16 @@ export function apply(ctx, config) {
   async function applyUpgrade(version) {
     if (managed) throw httpError(409, MANAGED_MESSAGE)
     if (isReloading()) throw new Error('a reload is already in progress')
+    if (updater.status().restartRequired) throw new Error('the installed version is ready; restart the host before applying another update')
     const pendingKey = Symbol.for('our-free-model.pending-upgrade')
     let pending
     try {
       const result = await updater.apply({
         version,
         activate: async installed => {
+          if (!canSafelyHotReload(ctx.loader, PKG_URL.href)) {
+            return { ok: false, error: 'safe hot reload is unavailable in this host; restart the host to load installed files', restored: true, restartRequired: true }
+          }
           pending = { version: installed.version }
           globalThis[pendingKey] = pending
           return selfReload(ctx, { logger, packageUrl: PKG_URL.href, entryUrl: ENTRY_URL, expectedVersion: installed.version })
@@ -943,7 +1025,12 @@ export function apply(ctx, config) {
       // Notification uses the successor's stores and hub. The predecessor's
       // effects have already been disposed by the swap.
       try { pending?.notify?.() } catch (error) { logger.warn?.(`our-free-model: upgrade notification failed (${error?.message ?? error})`) }
-      return { ...result, reloaded: true }
+      if (result.restartRequired === true) {
+        settings.update({ installedVersion: result.version })
+        settings.flush()
+        push.emit('upgraded', { version: result.version, restartRequired: true })
+      }
+      return { ...result, reloaded: result.restartRequired !== true }
     } finally {
       if (globalThis[pendingKey] === pending) globalThis[pendingKey] = undefined
     }
@@ -955,7 +1042,13 @@ export function apply(ctx, config) {
    */
   let watcher = undefined
   function syncWatcher() {
-    const wanted = settings.get().autoReloadWatch === true
+    const safeReload = canSafelyHotReload(ctx.loader, PKG_URL.href)
+    if (!managed && settings.get().autoReloadWatch === true && !safeReload) {
+      settings.update({ autoReloadWatch: false })
+      settings.flush()
+      logger.warn?.('our-free-model: disabled automatic hot reload because this host does not expose a safe package-module cache')
+    }
+    const wanted = !managed && settings.get().autoReloadWatch === true && safeReload
     if (wanted && watcher === undefined) {
       watcher = watchPackage(PKG_DIR, {
         logger,
@@ -1044,11 +1137,21 @@ export function apply(ctx, config) {
   }
   const api = createApiRoutes({
     settings, stats, availability, catalog: () => modelRuntime.catalog, state,
-    refreshCatalog, refreshAvailability, syncForward, syncRelay, syncEgress,
+    refreshCatalog, refreshAvailability, syncForward, syncRelay, syncEgress, clearLaneBreaker,
+    extensions,
+    bunAvailable,
     onVisibilityChanged: emitTopology,
     pool: fetchPoolSnapshot,
     eacAuth,
     picks,
+    magpieEngine,
+    magpieModels,
+    onEngineStarted: () => {
+      settings.update({ magpieEnabled: true })
+      settings.flush()
+    },
+    subscriptions,
+    onSubscriptionsChanged: syncAggregateCatalog,
     // ── the aggregate lane's settings surface ────────────────────────────────
     // The registry is static data; the configured half is the settings file with
     // every key masked. Writing one provider rebuilds the catalog and re-emits
@@ -1137,7 +1240,7 @@ export function apply(ctx, config) {
           contextWindow: entry.contextWindow, maxOutput: entry.maxOutput,
         })),
         usable: state().catalog.filter(isComboEntry).map(publicCombo),
-        strategies: ['fallback', 'round-robin'],
+        strategies: [...COMBO_STRATEGIES],
       }),
       preview: patch => {
         if (patch === null || typeof patch !== 'object' || !Array.isArray(patch.models)
@@ -1297,6 +1400,7 @@ export function apply(ctx, config) {
     meta: () => ({
       version: packageVersion,
       distribution,
+      restartRequired: updater.status().restartRequired === true,
       generation,
       reloadedAt: settings.get().reloadedAt ?? 0,
       reloadCount: settings.get().reloadCount ?? 0,
@@ -1317,9 +1421,13 @@ export function apply(ctx, config) {
       refresh: () => feed.poll(),
     },
     update: {
-      status: () => managed
-        ? { ...updater.status(), managed: true, available: false, latest: '' }
-        : { ...updater.status(), notifiedFor: updateNotifiedFor },
+      status: () => {
+        const hotReloadAvailable = canSafelyHotReload(ctx.loader, PKG_URL.href)
+        const status = { ...updater.status(), hotReloadAvailable,
+          autoReloadWatch: !managed && hotReloadAvailable && settings.get().autoReloadWatch === true }
+        return managed ? { ...status, managed: true, available: false, latest: '' }
+          : { ...status, notifiedFor: updateNotifiedFor }
+      },
       check: async () => {
         if (managed) throw httpError(409, MANAGED_MESSAGE)
         const result = await updater.check()
@@ -1385,9 +1493,52 @@ export function apply(ctx, config) {
 
   // ── boot + background loop ──────────────────────────────────────────────────
   ctx.effect(() => () => {
+    extensions.dispose()
+    magpieModels.close()
+    const closing = magpieEngine.close()
     modelRuntime.dispose()
     stores.dispose()
+    return closing
   }, 'our-free-model: stores')
+
+  ctx.effect(() => {
+    if (settings.get().magpieEnabled === true) {
+      void magpieEngine.start().then(() => magpieModels.refresh()).catch(() => {
+        logger.warn?.('our-free-model: model workspace could not resume')
+      })
+      // The engine connects Claude through the locally installed Claude Code
+      // CLI; its own downloader cannot reach the release host from every
+      // network, so a pre-installed CLI is the practical requirement. Warn at
+      // boot — the user's first failed connect is too late to learn it.
+      if (findAgentCli('claude') === undefined) {
+        logger.warn?.('our-free-model: 未检测到 Claude Code CLI —— 在模型工作台连接 Claude 前请先安装（npm i -g @anthropic-ai/claude-code）。(Claude Code CLI not found; install it before connecting Claude in the model workspace)')
+      }
+    }
+  }, 'our-free-model: model workspace')
+
+  ctx.effect(() => {
+    // The extension mount: start every installed, enabled extension (its
+    // catalog lands through onCatalogChanged → syncExtensionCatalog), then
+    // warm the marketplace cache in the background — a cold registry only
+    // means an empty Discover tab, never a blocked lane.
+    void extensions.init().catch(error => {
+      logger.warn?.(`our-free-model: extension mount failed (${error?.message ?? error})`)
+    })
+    void extensions.refreshRegistry().catch(() => {})
+    // The marketplace index refreshes on its own cadence too: an update that
+    // lands upstream should reach the Installed tab without the user opening
+    // the market first. The TTL cache keeps ticks cheap; failures are silent —
+    // the next tick retries and the last good view keeps serving.
+    const registryTimer = setInterval(() => {
+      void extensions.refreshRegistry().catch(() => {})
+      // The automatic updater rides the same tick: it only installs what the
+      // soak has already cleared, so no extra network touch beyond the
+      // refresh's own fetches, and a failure is next tick's retry.
+      if (settings.get().autoUpdateExtensions === true) void extensions.autoUpdate().catch(() => {})
+    }, 6 * 60 * 60 * 1000)
+    registryTimer.unref?.()
+    return () => clearInterval(registryTimer)
+  }, 'our-free-model: extensions')
 
   ctx.effect(() => () => {
     void forward?.close().catch(() => {})
@@ -1436,7 +1587,7 @@ export function apply(ctx, config) {
       // topology event and the upgrade marker below down with it, reported as
       // a single "startup refresh failed" line.
       try {
-        await refreshCatalog({ probe: true, force: true })
+        await refreshCatalog({ probe: false, force: true })
       } catch (error) {
         logger.warn?.(`our-free-model: startup refresh failed (${error?.message ?? error})`)
       }
@@ -1467,9 +1618,9 @@ export function apply(ctx, config) {
    * stopped the whole plugin from activating. `timer` is not worth declaring on a
    * headless composition, and the mixin adds nothing here beyond `setTimeout` plus
    * a disposer: it must not hold the process open, and `disposed` ends it when the
-   * fiber goes away. Without any loop the availability probe would run once at
-   * boot, so a model that throttled, recovered, or moved behind the region gate
-   * would keep the picker position it was first given.
+   * fiber goes away. Without any loop the catalog would be read once at boot,
+   * so a model added, removed or renamed upstream would keep its boot-time
+   * position until a manual refresh.
    */
   // `ms` may be a function: the period is re-read on every re-arm, so an
   // interval changed on the settings page takes effect from the next cycle
@@ -1493,14 +1644,16 @@ export function apply(ctx, config) {
       if (hours > 0) void updater.check().then(() => pushUpdate(false)).catch(() => {})
     }, () => positiveOr(settings.get().feedPollMinutes, 30, 5) * 60_000)
   }
-  // The probe period is in minutes, and one minute is the floor — a value of 0 or
-  // a negative one would otherwise spin. This used to read `Math.max(60, …)`,
-  // which floored every interval below an hour *including the shipped default of
-  // 15*, so the number on the settings page was silently ignored.
+  // Automatic availability probing is disabled by owner policy. This loop only
+  // refreshes the listing and reads the egress; the interval keeps its setting
+  // name for upgrade compatibility. `/reprobe` is the only path that still asks
+  // for a probe, and it is driven by a manual button.
   every(() => {
     void (async () => {
       await watchEgress()
-      await refreshCatalog({ probe: true })
+      // throttleListing: the periodic round may keep the cached roster when it
+      // just refreshed — the upstream listing is read at most once per window.
+      await refreshCatalog({ probe: false, throttleListing: true })
     })().catch(error => logger.warn?.(`our-free-model: periodic refresh failed (${error?.message ?? error})`))
   }, () => positiveOr(settings.get().probeIntervalMinutes, 15, 1) * 60_000)
   // A failing egress watch means the network is down, which is worth one line —
@@ -1539,6 +1692,9 @@ export function apply(ctx, config) {
   refreshUpdatePush = () => pushUpdate(false)
 
   function emitTopology() {
+    // The composer refreshes on the host LLM service's own notification.
+    // `ctx.emit` from this plugin fiber is not that notification.
+    try { ctx.llm?.emitAdaptersUpdated?.() } catch { /* composition has no llm method */ }
     try { ctx.emit?.('llm/adapters-updated') } catch { /* no listener surface */ }
     registration.replace(routes())
   }
@@ -1593,6 +1749,16 @@ function sanitizeSettings(patch, current) {
     // Zero is a real answer here: it means "stop checking for updates".
     const hours = Number(next.updateCheckHours)
     next.updateCheckHours = Number.isFinite(hours) && hours >= 0 ? Math.trunc(hours) : (Number(current.updateCheckHours) || 6)
+  }
+  if (next.freeLane !== undefined) {
+    // The lane proxy is a URL the egress layer validates on save: a typo must
+    // fail the write, not the first turn. Everything else about the object is
+    // carried verbatim.
+    const incoming = next.freeLane
+    const merged = { ...(current.freeLane ?? {}), ...(incoming && typeof incoming === 'object' ? incoming : {}) }
+    const proxyUrl = String(merged.proxyUrl ?? '').trim()
+    setFreeLaneProxy(proxyUrl)
+    next.freeLane = { ...merged, proxyUrl }
   }
   return next
 }
@@ -1653,7 +1819,10 @@ const POOL_REASONS = new Set(['no-lane', 'gateway-status', 'malformed', 'unreach
 export function createApiRoutes(deps) {
   return async function handler(req, res) {
     const url = new URL(req.url ?? '/', 'http://localhost')
-    const routePath = url.pathname.replace(/^\/api\/our-free-model/, '').replace(/\/+$/, '') || '/'
+    const marker = '/api/our-free-model'
+    const markerAt = url.pathname.indexOf(marker)
+    const apiPrefix = markerAt >= 0 ? url.pathname.slice(0, markerAt + marker.length) : marker
+    const routePath = url.pathname.slice(markerAt >= 0 ? apiPrefix.length : 0).replace(/\/+$/, '') || '/'
     const method = String(req.method ?? 'GET').toUpperCase()
     const rejection = rejectionFor(req, deps.connection, deps.onAdmissionRejection)
     const send = (status, payload) => {
@@ -1661,10 +1830,46 @@ export function createApiRoutes(deps) {
       res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
       res.end(body)
     }
-    if (rejection !== undefined) return send(rejection, {
+    // Sandboxed extension assets carry a per-run HMAC capability in their path.
+    // They have an opaque origin and cannot send the host's authentication.
+    // The engine validates the capability and serves only that plugin's files.
+    const pluginAsset = ['GET', 'HEAD'].includes(method)
+      && /^\/engine\/ui\/_magpie\/plugin\/[a-f0-9]{32}\/[^?]+$/.test(routePath)
+    if (pluginAsset && deps.magpieEngine?.status().state !== 'ready') {
+      return send(503, { error: 'Model workspace is unavailable' })
+    }
+    if (rejection !== undefined && !pluginAsset) return send(rejection, {
       error: rejection === 401 ? 'unauthorized' : rejection === 503 ? 'admission unavailable' : 'forbidden',
     })
     try {
+      if (routePath === '/engine/status' && method === 'GET') {
+        return send(200, deps.magpieEngine?.status() ?? { state: 'unavailable', available: false })
+      }
+      if (routePath === '/engine/start' && method === 'POST') {
+        if (!deps.magpieEngine) return send(503, { error: 'Model workspace is unavailable' })
+        await deps.magpieEngine.start()
+        await deps.magpieModels?.refresh()
+        deps.onEngineStarted?.()
+        return send(200, deps.magpieEngine.status())
+      }
+      if (routePath === '/engine/refresh' && method === 'POST') {
+        if (!deps.magpieEngine) return send(503, { error: 'Model workspace is unavailable' })
+        await deps.magpieModels?.refresh()
+        return send(200, { ok: true })
+      }
+      if (routePath === '/engine/ui' || routePath.startsWith('/engine/ui/')) {
+        if (!deps.magpieEngine) return send(503, { error: 'Model workspace is unavailable' })
+        // Authentication above applies to every asset and engine operation.
+        if (routePath === '/engine/ui' && !url.pathname.endsWith('/')) {
+          res.writeHead(302, { location: `${apiPrefix}/engine/ui/` + url.search })
+          return res.end()
+        }
+        res.once?.('finish', () => {
+          if (method === 'POST') void deps.magpieModels?.refresh().catch(() => {})
+        })
+        const upstreamPath = url.pathname.slice(`${apiPrefix}/engine/ui`.length) || '/'
+        return await deps.magpieEngine.proxy(req, res, upstreamPath + url.search)
+      }
       if (method === 'GET' && routePath === '/summary') {
         return send(200, buildSummary(deps))
       }
@@ -1673,6 +1878,34 @@ export function createApiRoutes(deps) {
       }
       if (method === 'GET' && routePath === '/outlet') {
         return send(200, await deps.outletStatus())
+      }
+      if (routePath === '/subscriptions' || routePath.startsWith('/subscriptions/')) {
+        const action = routePath.slice('/subscriptions'.length)
+        const mutations = { '/import': 'import', '/import-local': 'importLocal', '/quota': 'refreshQuota',
+          '/enabled': 'setEnabled', '/remove': 'remove' }
+        if (!(method === 'GET' && (action === '' || action === '/discover'))
+          && !(method === 'POST' && Object.hasOwn(mutations, action))) {
+          return send(404, { error: 'not found' })
+        }
+        if (!deps.subscriptions) return send(503, { error: 'Subscription support is unavailable' })
+        if (method === 'GET') {
+          return send(200, { accounts: action === '/discover'
+            ? await deps.subscriptions.discover() : deps.subscriptions.list() })
+        }
+        const body = await readJson(req)
+        if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+          throw httpError(400, 'Invalid subscription request')
+        }
+        const controller = new AbortController()
+        const abort = () => controller.abort()
+        res.once?.('close', abort)
+        try {
+          await deps.subscriptions[mutations[action]](action === '/quota'
+            ? { id: body.id, signal: controller.signal } : body)
+          if (action !== '/quota') deps.onSubscriptionsChanged?.()
+          if (!controller.signal.aborted) return send(200, { accounts: deps.subscriptions.list() })
+          return
+        } finally { res.removeListener?.('close', abort) }
       }
       // ── the aggregate lane ─────────────────────────────────────────────────
       if (method === 'GET' && routePath === '/providers') {
@@ -1767,6 +2000,14 @@ export function createApiRoutes(deps) {
           return send(404, { error: `pool unavailable (${reason})` })
         }
       }
+      if (method === 'GET' && routePath === '/disclaimer') {
+        return send(200, { ...DISCLAIMER, acknowledged: disclaimerAcknowledged(deps.settings.get()) })
+      }
+      if (method === 'POST' && routePath === '/disclaimer/ack') {
+        deps.settings.update({ disclaimerAck: DISCLAIMER_VERSION })
+        deps.settings.flush()
+        return send(200, { ok: true, acknowledged: true })
+      }
       if (method === 'GET' && routePath === '/announcement') {
         // A managed install also stands down the owner's onboarding copy: the
         // pack, not the plugin, speaks for what is new.
@@ -1824,6 +2065,9 @@ export function createApiRoutes(deps) {
         if (status.applying || status.recoveryRequired) return send(409, {
           error: status.applying ? 'an upgrade is already running' : 'restore the retained upgrade backup before reloading',
         })
+        if (status.restartRequired === true || status.hotReloadAvailable === false) return send(409, {
+          error: 'safe hot reload is unavailable in this host; restart the host to reload plugin files', restartRequired: true,
+        })
         // Answer first, then swap: the response rides an already-accepted
         // socket, but the client should not wait on the reload finishing. The
         // swap closure is `deps.hotReload`, applied inside `apply` — this
@@ -1840,7 +2084,8 @@ export function createApiRoutes(deps) {
         const patch = await readJson(req)
         const visibility = validateModelVisibility(patch)
         const current = deps.settings.get()
-        const next = sanitizeSettings({ ...current, ...pick(patch, ['enabled', 'exposeRegionModels', 'probeIntervalMinutes', 'defaultMaxTokens', 'announcementAck', 'feedUrl', 'feedPollMinutes', 'notifyOs', 'updateCheckHours', 'autoReloadWatch']), ...visibility }, current)
+        const next = sanitizeSettings({ ...current, ...pick(patch, ['enabled', 'exposeRegionModels', 'probeIntervalMinutes', 'defaultMaxTokens', 'announcementAck', 'feedUrl', 'feedPollMinutes', 'notifyOs', 'updateCheckHours', 'autoReloadWatch', 'freeLane', 'developerPlugins', 'autoUpdateExtensions']), ...visibility }, current)
+        if (next.autoReloadWatch === true && deps.update.status().hotReloadAvailable === false) next.autoReloadWatch = false
         if (patch.forward !== undefined) {
           const forward = { ...(current.forward ?? {}), ...pick(patch.forward, ['enabled', 'host', 'port']) }
           // The listener spends this machine's lane, and a routable bind address
@@ -1900,12 +2145,139 @@ export function createApiRoutes(deps) {
         return send(200, { ok: true, settings: publicSettings(deps.settings.get(), deps.forwardInfo(), deps.egressInfo()) })
       }
       if (method === 'POST' && routePath === '/refresh') {
-        await deps.refreshCatalog({ probe: true, force: true })
+        // A listing refresh must not turn into a probe round; only /reprobe does.
+        await deps.refreshCatalog({ probe: false, force: true })
         return send(200, { ok: true, ...buildSummary(deps) })
       }
       if (method === 'POST' && routePath === '/reprobe') {
-        await deps.refreshAvailability(true)
-        return send(200, { ok: true, ...buildSummary(deps) })
+        // One probe, one model: the caller's pick, or the roster head. The
+        // quota breaker refuses while a window is open (the response names it).
+        const body = await readJson(req).catch(() => ({}))
+        const outcome = await deps.refreshAvailability(true, { model: typeof body?.model === 'string' ? body.model : undefined })
+        return send(200, { ok: true, probe: outcome, ...buildSummary(deps) })
+      }
+      if (method === 'POST' && routePath === '/lane/clear') {
+        // 换出口后重试一次：出口已变（或用户自备了新出口代理），把额度断路器
+        // 清掉，让下一次手动检测/真实回合重新出发。一次调用只清一次。
+        const cleared = deps.clearLaneBreaker()
+        return send(200, { ok: true, cleared, ...buildSummary(deps) })
+      }
+      if (method === 'POST' && routePath === '/lane/echo') {
+        // 测试出口：打第三方回显服务，不打免费网关 —— 一次测试不花配额。
+        try {
+          const echo = await laneProxyEcho({ signal: req.signal ?? undefined })
+          return send(200, { ok: true, ...echo })
+        } catch (error) {
+          return send(502, { ok: false, error: String(error?.message ?? error).slice(0, 200) })
+        }
+      }
+
+      // ── the extension marketplace ───────────────────────────────────────────
+      if (routePath === '/extensions' || routePath.startsWith('/extensions/')) {
+        if (deps.extensions === undefined) return send(503, { error: 'the extension platform is unavailable' })
+        const extensions = deps.extensions
+        if (method === 'GET' && routePath === '/extensions/cover') {
+          // The marketplace card's banner. An <img> cannot attach headers, so
+          // the image rides the same admission fence as every fetch from the
+          // settings page — same origin, same cookies, same gate. Failure is
+          // a 404 the card renders without; a missing banner never breaks it.
+          const image = await extensions.coverImage(url.searchParams.get('id') ?? '')
+          if (image === null) return send(404, { error: 'no cover for this extension' })
+          res.writeHead(200, {
+            'content-type': image.contentType,
+            'content-length': image.bytes.length,
+            // Cosmetics only: a stale banner for a few minutes is invisible.
+            'cache-control': 'private, max-age=600',
+            'x-content-type-options': 'nosniff',
+          })
+          res.end(image.bytes)
+          return
+        }
+        if (method === 'GET' && routePath === '/extensions') {
+          // A first paint waits briefly for the boot warm-up and hears why a
+          // read failed; `registryError` used to be structurally empty because
+          // `registryView()` never throws.
+          const status = await extensions.registryStatusSoon()
+          // `updates` feeds the soak countdown on the Installed tab; `audit`
+          // gives the page its own 最近操作 trail; the settings bit lets the
+          // toolbar's auto-update switch render the value it will write.
+          return send(200, {
+            installed: extensions.listInstalled().filter(record => record.builtin !== true),
+            registry: status.registry,
+            registryError: status.error,
+            updates: extensions.updatesAvailable(),
+            registryMeta: extensions.registryMeta(),
+            audit: extensions.auditTail(30),
+            autoUpdate: deps.settings.get().autoUpdateExtensions === true,
+          })
+        }
+        if (method === 'POST' && routePath === '/extensions/registry/refresh') {
+          try {
+            await extensions.refreshRegistry({ force: true })
+            return send(200, { ok: true, installed: extensions.listInstalled().filter(record => record.builtin !== true), registry: extensions.registryView() })
+          } catch (error) {
+            return send(502, { error: String(error?.message ?? error), installed: extensions.listInstalled().filter(record => record.builtin !== true) })
+          }
+        }
+        if (method === 'POST' && routePath === '/extensions/install') {
+          const body = await readJson(req)
+          try {
+            const record = await extensions.install(String(body?.id ?? ''), { version: typeof body?.version === 'string' ? body.version : undefined })
+            return send(200, { ok: true, record, installed: extensions.listInstalled().filter(record => record.builtin !== true) })
+          } catch (error) {
+            return send(400, { error: String(error?.message ?? error) })
+          }
+        }
+        if (method === 'POST' && routePath === '/extensions/uninstall') {
+          const body = await readJson(req)
+          try {
+            await extensions.uninstall(String(body?.id ?? ''))
+            return send(200, { ok: true, installed: extensions.listInstalled().filter(record => record.builtin !== true) })
+          } catch (error) {
+            return send(400, { error: String(error?.message ?? error) })
+          }
+        }
+        if (method === 'POST' && routePath === '/extensions/toggle') {
+          const body = await readJson(req)
+          try {
+            const record = await extensions.setEnabled(String(body?.id ?? ''), body?.enabled === true)
+            return send(200, { ok: true, record, installed: extensions.listInstalled().filter(record => record.builtin !== true) })
+          } catch (error) {
+            return send(400, { error: String(error?.message ?? error) })
+          }
+        }
+        if (method === 'POST' && routePath === '/extensions/config') {
+          const body = await readJson(req)
+          try {
+            const record = await extensions.saveConfig(String(body?.id ?? ''), body?.values ?? {})
+            // `installed` travels with every mutation: the page renders its cards
+            // from it, so a config write has to hand the new values back or the
+            // control snaps to the state it was rendered with.
+            return send(200, { ok: true, record, installed: extensions.listInstalled().filter(record => record.builtin !== true) })
+          } catch (error) {
+            return send(400, { error: String(error?.message ?? error) })
+          }
+        }
+        if (method === 'POST' && routePath === '/extensions/secret') {
+          const body = await readJson(req)
+          try {
+            const record = await extensions.saveSecret(String(body?.id ?? ''), String(body?.key ?? ''), body?.value)
+            return send(200, { ok: true, record, installed: extensions.listInstalled().filter(record => record.builtin !== true) })
+          } catch (error) {
+            return send(400, { error: String(error?.message ?? error) })
+          }
+        }
+        if (method === 'POST' && routePath === '/extensions/self-test') {
+          // The manifest's optional selfTest(ctx) on demand; the verdict rides
+          // back as data (a failed hook is a result, not an HTTP error), so the
+          // card renders ✗ + reason instead of the page falling into the toast.
+          const body = await readJson(req)
+          try {
+            return send(200, await extensions.runSelfTest(String(body?.id ?? '')))
+          } catch (error) {
+            return send(400, { error: String(error?.message ?? error) })
+          }
+        }
       }
       if (method === 'GET' && routePath === '/forward/key') {
         return send(200, { key: deps.settings.get().forwardKey ?? '' })
@@ -1966,7 +2338,15 @@ export function createApiRoutes(deps) {
       return send(404, { error: 'not found' })
     } catch (error) {
       const status = Number(error?.statusCode)
-      return send(Number.isInteger(status) && status >= 400 && status <= 599 ? status : 500, { error: String(error?.message ?? error) })
+      const responseStatus = Number.isInteger(status) && status >= 400 && status <= 599 ? status : 500
+      if (routePath === '/subscriptions' || routePath.startsWith('/subscriptions/')) {
+        // Parse errors can quote an import body; never echo credential input.
+        return send(responseStatus, { error: ({
+          400: 'Invalid subscription request', 404: 'Subscription account not found',
+          413: 'request body too large', 499: 'Subscription request aborted',
+        })[responseStatus] ?? 'Subscription operation failed' })
+      }
+      return send(responseStatus, { error: String(error?.message ?? error) })
     }
   }
 }
@@ -2291,7 +2671,7 @@ function buildSummary(deps) {
   // and the aggregate lane are named by a listing round that already succeeded,
   // and a combo is a view over rows that were themselves named — none of them is
   // pinged. A listing is not an inference verdict; explicit tests add their own samples.
-  const unprobed = entry => isEacEntry(entry) || isKiloEntry(entry) || isAggregateEntry(entry) || isComboEntry(entry)
+  const unprobed = entry => isEacEntry(entry) || isKiloEntry(entry) || isAggregateEntry(entry) || isComboEntry(entry) || isSubscriptionEntry(entry)
   return {
     catalog: state.catalog.map(entry => ({
       ...entry,
@@ -2312,8 +2692,22 @@ function buildSummary(deps) {
     settings: publicSettings(deps.settings.get(), forwardInfo, deps.egressInfo()),
     egress: forwardInfo.egress ?? snapshot.egress ?? null,
     outlet: deps.egressInfo(),
+    // The free lane's quota breaker and its exit: what the page's lane card
+    // renders as the countdown / lock banner, and the proxy seam issue #708's
+    // bypass reduces to. `lane` is null until a real verdict exists.
+    lane: snapshot.lane ?? null,
+    freeLane: {
+      proxyActive: freeLaneProxyActive(),
+      proxyConfigured: String(deps.settings.get().freeLane?.proxyUrl ?? '').trim() !== '',
+      transport: process.env.OUR_FREE_MODEL_FREE_TRANSPORT ?? 'auto',
+    },
+    // Environment readiness for the free lane: the official POST inference
+    // needs a local Bun, and a user who never learns that reads only a failed
+    // turn. Probed once at boot (see the readiness effect below).
+    bun: deps.bunAvailable !== false,
     probedAt: snapshot.at ?? 0,
     announcementVersion: ANNOUNCEMENT_VERSION,
+    disclaimerVersion: DISCLAIMER_VERSION,
     version: deps.meta().version,
     distribution: deps.meta().distribution,
     announcements: { unread: feedView.unread, fetchedAt: feedView.fetchedAt },
@@ -2328,6 +2722,7 @@ function buildSummary(deps) {
     // Whether the absorbed free-channel pack is live on this host, and its
     // failure reason when it is not (see the mount in `apply`).
     channels: deps.channels?.() ?? { state: 'unknown', error: '' },
+    extensions: deps.extensions !== undefined ? { installed: deps.extensions.listInstalled().filter(record => record.builtin !== true) } : null,
     update: { available: update.available, latest: update.latest, current: update.current, checkedAt: update.checkedAt, applying: update.applying, managed: update.managed === true },
   }
 }

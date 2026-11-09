@@ -74,14 +74,19 @@ export async function runModelTest(createStream, { signal, timeoutMs = MODEL_TES
 
 /** Keep manual samples apart from the automatic round so an older probe cannot erase them. */
 export function modelAvailability(id, snapshot, listed = false) {
-  const probe = listed ? undefined : snapshot?.results?.[id]
-  const manual = snapshot?.manualResults?.[id]
+  // 旧出口的测量仍保留在磁盘，但不再作为当前出口的可用性判定。
+  const probeRow = listed ? undefined : snapshot?.results?.[id]
+  const manualRow = snapshot?.manualResults?.[id]
+  const probe = probeRow?.stale === true ? undefined : probeRow
+  const manual = manualRow?.stale === true ? undefined : manualRow
   // Compare a probe's request time with the completed manual measurement, so
   // an older in-flight probe cannot supersede it merely by finishing later.
   // Older saved snapshots have only `at`, which retains their previous order.
   const measured = manual && (!probe || manual.at >= (probe.startedAt ?? probe.at)) ? manual : probe
   return {
-    availabilitySource: measured === manual && manual ? 'manual' : listed ? 'listing' : 'probe',
+    availabilitySource: measured === manual && manual ? 'manual'
+      : measured?.source === 'passive' ? 'passive'
+        : listed ? 'listing' : 'probe',
     availability: measured?.state ?? 'unknown',
     detail: measured?.detail ?? '', probedAt: measured?.at ?? 0,
     ttftMs: measured?.ttftMs, latencyMs: measured?.latencyMs,
